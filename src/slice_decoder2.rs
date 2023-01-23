@@ -4,43 +4,55 @@ use std::{
     ops::Range,
 };
 
+fn print_slice_2(len: ByteNum, range: Range<ByteNum>, slice: &[u8]) {
+    let mut offset = 0;
+    for item in slice_parts(len, range) {
+        if slice.len() < offset + item.size() {
+            println!("incomplete slice");
+            return;
+        }
+        match item {
+            StreamItem::Header => {
+                let data = &slice[offset..offset + 8];
+                println!("header  {} {}", hex::encode(data), u64::from_le_bytes(data.try_into().unwrap()));
+            }
+            StreamItem::Hashes { left, right } => {
+                let data = &slice[offset..offset + 64];
+                let used = |b| if b { "*" } else { " " };
+                println!("hash {}  {}", used(left), hex::encode(&data[..32]));
+                println!("hash {}  {}", used(right), hex::encode(&data[32..]));
+            }
+            StreamItem::Data { start, size } => {
+                let data = &slice[offset..offset + size];
+                println!("data    {}..{}", start.to_usize(), start.to_usize() + size);
+                for chunk in data.chunks(32) {
+                    println!("data    {}", hex::encode(chunk));
+                }
+            }
+        }
+        println!("");
+        offset += item.size();
+    }
+}
+
 fn slice_parts(len: ByteNum, range: Range<ByteNum>) -> impl Iterator<Item = StreamItem> {
     struct State {
         len: ByteNum,
-        start: ByteNum,
-        end: ByteNum,
+        range: Range<ByteNum>,
         res: Vec<StreamItem>,
     }
     impl State {
 
-        fn blocks(&self) -> BlockNum {
-            blocks(self.len, BlockLevel(0))
-        }
-
         fn hashes(&self) -> NodeNum {
-            num_hashes(self.blocks())
-        }
-
-        fn contains(&self, block: BlockNum) -> bool {
-            self.start_block() <= block && block < self.end_block()
-        }
-
-        // block in which the start of the range lies
-        fn start_block(&self) -> BlockNum {
-            BlockNum(self.start.0 / 1024)
-        }
-
-        // block in which the end of the range lies
-        fn end_block(&self) -> BlockNum {
-            BlockNum((self.end.0 + 1023) / 1024)
+            num_hashes(blocks(self.len, BlockLevel(0)))
         }
 
         fn traverse(&mut self, offset: NodeNum) {
             let position = ByteNum((offset.0 + 1) / 2 * 1024);
             if level(offset).0 > 0 {
-                let (left, right) = if self.end <= position {
+                let (left, right) = if self.range.end <= position {
                     (true, false)
-                } else if self.start >= position {
+                } else if self.range.start >= position {
                     (false, true)
                 } else {
                     (true, true)
@@ -61,9 +73,8 @@ fn slice_parts(len: ByteNum, range: Range<ByteNum>) -> impl Iterator<Item = Stre
     }
     let mut state = State {
         len,
-        start: range.start,
-        end: range.end,
-        res: Vec::new(),
+        range,
+        res: vec![StreamItem::Header],
     };
     state.traverse(root(blocks(len, BlockLevel(0))));
     state.res.into_iter()
@@ -84,6 +95,8 @@ pub struct BlockIter {
 
 #[derive(Debug)]
 pub enum StreamItem {
+    /// expect a 8 byte header
+    Header,
     /// you will get 2 hashes, so 64 bytes.
     /// at least one of them will be relevant for later.
     Hashes {
@@ -101,6 +114,16 @@ pub enum StreamItem {
         /// size of the range, this is at most 2 chunks
         size: usize
     },
+}
+
+impl StreamItem {
+    pub fn size(&self) -> usize {
+        match self {
+            StreamItem::Header => 8,
+            StreamItem::Hashes { .. } => 64,
+            StreamItem::Data { size, .. } => *size,
+        }
+    }
 }
 
 impl BlockIter {
@@ -386,10 +409,7 @@ fn print_blake(data: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bao::decode::SliceDecoder;
     use bao::encode::SliceExtractor;
-    use futures::StreamExt;
-    use core::slice;
     use proptest::prelude::*;
     use std::io::{Cursor, Read};
 
@@ -467,6 +487,7 @@ mod tests {
         // need to skip the length prefix
         let content = &slice[8..];
         print_blake(&slice);
+        print_slice_2(len, slice_start..slice_start + slice_len, &slice);
         // create an inner decoder to decode the entire slice
         let mut decoder = DecoderInner::for_range(
             Cursor::new(&content),
@@ -554,39 +575,5 @@ mod tests {
     #[test]
     fn print_block_seqence_1() {
         print_block_seqence(ByteNum(32768 * 2 - 1), ByteNum(43453)..ByteNum(434530000));
-    }
-
-    #[test]
-    fn stream_test() {
-        use futures::Stream;
-        use async_stream::stream;
-        fn zero_to_three() -> impl Stream<Item = u32> {
-            stream! {
-                for i in 0..3 {
-                    yield i;
-                }
-            }
-        }
-
-        let s = zero_to_three();
-        tokio::pin!(s);
-        for i in StreamIter(s) {
-            println!("{}", i);
-        }
-
-        struct StreamIter<S>(S);
-
-        impl<S: Stream + Unpin> Iterator for StreamIter<S> {
-            type Item = S::Item;
-
-            fn next(&mut self) -> Option<Self::Item> {
-                let waker = futures::task::noop_waker_ref();
-                let mut cx = std::task::Context::from_waker(waker);
-                match self.0.poll_next_unpin(&mut cx) {
-                    std::task::Poll::Ready(item) => item,
-                    std::task::Poll::Pending => None,
-                }
-            }
-        }
     }
 }
