@@ -181,6 +181,14 @@ fn blocks0(len: u64, block_level: u32) -> u64 {
     len / block_size + if len % block_size == 0 { 0 } else { 1 }
 }
 
+const fn start_block(x: u64, n: u64) -> u64 {
+    x / n
+}
+
+const fn end_block(x: u64, n: u64) -> u64 {
+    x / n + if x % n == 0 { 0 } else { 1 }
+}
+
 pub(crate) fn full_blocks(len: ByteNum, block_level: BlockLevel) -> BlockNum {
     BlockNum(full_blocks0(len.0, block_level.0))
 }
@@ -224,7 +232,7 @@ fn left_child0(offset: u64) -> Option<u64> {
     }
 }
 
-pub(crate) fn right_child(offset: NodeNum) -> Option<NodeNum> {
+fn right_child(offset: NodeNum) -> Option<NodeNum> {
     right_child0(offset.0).map(NodeNum)
 }
 

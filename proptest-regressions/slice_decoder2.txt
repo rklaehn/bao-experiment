@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc b4d023de28721c0ec555427bf412e63e12c24f6fcdb04af8380e404e0e7ff0a2 # shrinks to size = 0
+cc 59a48f916ba2c779b05ef2e8605f4ec33614a0f9e372e037816a0dcc71d70f89 # shrinks to (size, start, len) = (ByteNum(548), ByteNum(520), ByteNum(505))
+cc 4fe59d5db2aa5f35b2853eaf92385ca44c630f6da691f12f1f1e145ab83a7057 # shrinks to (size, start, len) = (ByteNum(2126), ByteNum(2048), ByteNum(0))
