@@ -1,13 +1,14 @@
 use crate::tree::*;
 use futures::AsyncRead;
-use std::io::{self, Read};
+use std::{
+    io::{self, Read},
+    ops::Range,
+};
 
 pub struct DecoderInner<R> {
     inner: R,
-    // start block (inclusive)
-    start_block: BlockNum,
-    // end block (exclusive)
-    end_block: BlockNum,
+    // range of blocks for which we get data
+    blocks: Range<BlockNum>,
     /// total len of the data
     len: ByteNum,
     // offset of the hash on top of the stack
@@ -19,17 +20,15 @@ pub struct DecoderInner<R> {
 }
 
 impl<R> DecoderInner<R> {
-    pub fn new(
-        inner: R,
-        hash: blake3::Hash,
-        start_block: BlockNum,
-        end_block: BlockNum,
-        len: ByteNum,
-    ) -> Self {
+    pub fn for_range(inner: R, hash: blake3::Hash, len: ByteNum, range: Range<ByteNum>) -> Self {
+        let blocks = block_range(range, BlockLevel(0));
+        Self::new(inner, hash, blocks, len)
+    }
+
+    pub fn new(inner: R, hash: blake3::Hash, blocks: Range<BlockNum>, len: ByteNum) -> Self {
         Self {
             inner,
-            start_block,
-            end_block,
+            blocks,
             len,
             offset: Self::root_offset(len),
             stack: vec![hash],
@@ -55,7 +54,6 @@ impl<R> DecoderInner<R> {
 }
 
 impl<R: Read> DecoderInner<R> {
-
     fn blocks(&self) -> BlockNum {
         blocks(self.len, self.block_level())
     }
@@ -84,11 +82,11 @@ impl<R: Read> DecoderInner<R> {
                 if parent != expected {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "hash mismatch"));
                 }
-                if self.end_block <= position {
+                if self.blocks.end <= position {
                     // we only need to go to the left
                     self.stack.push(lh);
                     self.offset = left_child(self.offset).unwrap();
-                } else if self.start_block >= position {
+                } else if self.blocks.start >= position {
                     // we only need to go to the right
                     self.stack.push(rh);
                     self.offset = right_child(self.offset).unwrap();
@@ -122,7 +120,7 @@ impl<R: Read> DecoderInner<R> {
 
     fn read_and_validate_leaf(&mut self) -> io::Result<usize> {
         let block = index(self.offset);
-        if block < self.start_block || block >= self.end_block {
+        if !self.blocks.contains(&block) {
             return Ok(0);
         }
         let size = leaf_size(block, self.block_level(), self.len).to_usize();
@@ -158,38 +156,59 @@ impl<R: Read> DecoderInner<R> {
 mod tests {
     use super::*;
     use bao::encode::SliceExtractor;
+    use proptest::prelude::*;
     use std::io::{Cursor, Read};
 
-    fn mk_test_data(n: usize) -> Vec<u8> {
+    fn create_test_data(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i / 1024) as u8).collect()
     }
 
-    fn mk_slice(data: &[u8]) -> (blake3::Hash, Vec<u8>) {
+    fn encode_slice(data: &[u8], slice_start: u64, slice_len: u64) -> (blake3::Hash, Vec<u8>) {
         let (encoded, hash) = bao::encode::encode(data);
-        let mut extractor = SliceExtractor::new(Cursor::new(&encoded), 0, data.len() as u64);
+        let mut extractor = SliceExtractor::new(Cursor::new(&encoded), slice_start, slice_len);
         let mut slice = vec![];
         extractor.read_to_end(&mut slice).unwrap();
         (hash, slice)
     }
 
-    #[test]
-    fn test_decode() {
-        let len = 8190;
-        let (hash, slice) = mk_slice(&mk_test_data(len));
-        println!("{}", hex::encode(&slice));
-        println!("{}", slice.len() - 8 - 64);
+    fn test_decode_all_impl(len: usize) {
+        // create a slice encoding the entire data - equivalent to the bao inline encoding
+        let (hash, slice) = encode_slice(&create_test_data(len), 0, len as u64);
+        // need to skip the length prefix
+        let content = &slice[8..];
+        // create an inner decoder to decode the entire slice
         let mut decoder = DecoderInner::new(
-            Cursor::new(&slice[8..]),
+            Cursor::new(&content),
             hash,
-            BlockNum(0),
-            BlockNum(8),
+            block_range(ByteNum(0)..ByteNum(len as u64), BlockLevel(0)),
             ByteNum(len as u64),
         );
+        // advance until there is nothing left
         while let Ok(n) = decoder.advance() {
             println!("read {} bytes", n);
             if n == 0 {
                 break;
             }
         }
+        // check that we have read the entire slice
+        let cursor = decoder.into_inner();
+        assert_eq!(cursor.position(), content.len() as u64);
+    }
+
+    proptest! {
+        #[test]
+        fn test_decode_all(size in 1usize..32768) {
+            test_decode_all_impl(size);
+        }
+    }
+
+    #[test]
+    fn test_decode_all_1() {
+        test_decode_all_impl(1234456);
+    }
+
+    #[test]
+    fn test_decode_all_2() {
+        test_decode_all_impl(0);
     }
 }

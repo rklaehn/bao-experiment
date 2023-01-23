@@ -318,6 +318,14 @@ fn sibling0(offset: u64) -> u64 {
 }
 
 /// Given a range of bytes, returns a range of nodes that cover that range.
+pub fn block_range(byte_range: Range<ByteNum>, block_level: BlockLevel) -> Range<BlockNum> {
+    let block_size = block_size(block_level).0;
+    let start_block = byte_range.start.0 / block_size;
+    let end_block = (byte_range.end.0 + block_size - 1) / block_size;
+    BlockNum(start_block)..BlockNum(end_block)
+}
+
+/// Given a range of bytes, returns a range of nodes that cover that range.
 pub fn node_range(byte_range: Range<ByteNum>, block_level: BlockLevel) -> Range<NodeNum> {
     let block_size = block_size(block_level).0;
     let start_block = byte_range.start.0 / block_size;
@@ -328,11 +336,13 @@ pub fn node_range(byte_range: Range<ByteNum>, block_level: BlockLevel) -> Range<
 }
 
 /// byte range for a given block, given a block level and total data len
-pub fn leaf_byte_range(index: BlockNum, block_level: BlockLevel, data_len: ByteNum) -> Range<ByteNum> {
+pub fn leaf_byte_range(
+    index: BlockNum,
+    block_level: BlockLevel,
+    data_len: ByteNum,
+) -> Range<ByteNum> {
     let start = index.to_bytes(block_level);
-    let end = (index + 1)
-        .to_bytes(block_level)
-        .min(data_len.max(start));
+    let end = (index + 1).to_bytes(block_level).min(data_len.max(start));
     start..end
 }
 
