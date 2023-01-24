@@ -4,93 +4,149 @@ use std::{
     ops::Range,
 };
 
-fn print_slice_2(len: ByteNum, range: Range<ByteNum>, slice: &[u8]) {
-    let mut offset = 0;
-    for item in slice_parts(len, range) {
-        if slice.len() < offset + item.size() {
-            println!("incomplete slice");
-            return;
-        }
-        match item {
-            StreamItem::Header => {
-                let data = &slice[offset..offset + 8];
-                println!("header  {} {}", hex::encode(data), u64::from_le_bytes(data.try_into().unwrap()));
-            }
-            StreamItem::Hashes { left, right } => {
-                let data = &slice[offset..offset + 64];
-                let used = |b| if b { "*" } else { " " };
-                println!("hash {}  {}", used(left), hex::encode(&data[..32]));
-                println!("hash {}  {}", used(right), hex::encode(&data[32..]));
-            }
-            StreamItem::Data { start, size } => {
-                let data = &slice[offset..offset + size];
-                println!("data    {}..{}", start.to_usize(), start.to_usize() + size);
-                for chunk in data.chunks(32) {
-                    println!("data    {}", hex::encode(chunk));
-                }
-            }
-        }
-        println!("");
-        offset += item.size();
-    }
-}
-
-fn slice_parts(len: ByteNum, range: Range<ByteNum>) -> impl Iterator<Item = StreamItem> {
-    struct State {
-        len: ByteNum,
-        range: Range<ByteNum>,
-        res: Vec<StreamItem>,
-    }
-    impl State {
-
-        fn hashes(&self) -> NodeNum {
-            num_hashes(blocks(self.len, BlockLevel(0)))
-        }
-
-        fn traverse(&mut self, offset: NodeNum) {
-            let position = ByteNum((offset.0 + 1) / 2 * 1024);
-            if level(offset).0 > 0 {
-                let (left, right) = if self.range.end <= position {
-                    (true, false)
-                } else if self.range.start >= position {
-                    (false, true)
-                } else {
-                    (true, true)
-                };
-                self.res.push(StreamItem::Hashes { left, right });
-                if left {
-                    self.traverse(left_child(offset).unwrap());
-                }
-                if right {
-                    self.traverse(right_descendant(offset, self.hashes()).unwrap());
-                }
-            } else {
-                let start = position;
-                let end = (start + 1024).min(self.len);
-                self.res.push(StreamItem::Data { start, size: (end - start).to_usize() })
-            }
-        }
-    }
-    let mut state = State {
-        len,
-        range,
-        res: vec![StreamItem::Header],
-    };
-    state.traverse(root(blocks(len, BlockLevel(0))));
-    state.res.into_iter()
-}
-
-pub struct BlockIter {
-    /// total len of the data in bytes
+struct SliceIter {
     len: ByteNum,
-    /// start offset of the range we are interested in
-    start: ByteNum,
-    /// end offset of the range we are interested in
-    end: ByteNum,
-    // current offset
-    offset: NodeNum,
-    // done?
-    done: bool,
+    range: Range<ByteNum>,
+    res: std::iter::Peekable<std::vec::IntoIter<StreamItem>>,
+}
+
+impl SliceIter {
+    fn len(&self) -> ByteNum {
+        self.len
+    }
+
+    fn range(&self) -> Range<ByteNum> {
+        self.range.clone()
+    }
+
+    fn new(len: ByteNum, range: Range<ByteNum>) -> SliceIter {
+        struct State {
+            len: ByteNum,
+            range: Range<ByteNum>,
+            res: Vec<StreamItem>,
+        }
+        // make sure the range is within 0..len
+        let mut range = range;
+        range.start = range.start.min(len);
+        range.end = range.end.min(len);
+        impl State {
+            fn hashes(&self) -> NodeNum {
+                num_hashes(blocks(self.len, BlockLevel(0)))
+            }
+
+            fn traverse(&mut self, offset: NodeNum) {
+                let position = ByteNum((offset.0 + 1) / 2 * 1024);
+                let is_root = offset == root(blocks(self.len, BlockLevel(0)));
+                if level(offset).0 > 0 {
+                    let (left, right) = if self.range.end <= position {
+                        (true, false)
+                    } else if self.range.start >= position {
+                        (false, true)
+                    } else {
+                        (true, true)
+                    };
+                    self.res.push(StreamItem::Hashes {
+                        left,
+                        right,
+                        is_root,
+                    });
+                    if left {
+                        self.traverse(left_child(offset).unwrap());
+                    }
+                    if right {
+                        self.traverse(right_descendant(offset, self.hashes()).unwrap());
+                    }
+                } else {
+                    let start = position;
+                    let end = (start + 1024).min(self.len);
+                    self.res.push(StreamItem::Data {
+                        start,
+                        size: (end - start).to_usize(),
+                        is_root,
+                    })
+                }
+            }
+        }
+        let mut state = State {
+            len,
+            range,
+            res: vec![StreamItem::Header],
+        };
+        state.traverse(root(blocks(len, BlockLevel(0))));
+        // todo: it is easy to make this a proper iterator, and even possible
+        // to make it an iterator without any state, but let's just keep it simple
+        // for now.
+        Self {
+            len: state.len,
+            range: state.range,
+            res: state.res.into_iter().peekable(),
+        }
+    }
+
+    pub fn peek(&mut self) -> Option<&StreamItem> {
+        self.res.peek()
+    }
+
+    /// prints a bao encoded slice
+    ///
+    /// this is a simple use case for how to use the slice iterator to figure
+    /// out what is what.
+    fn print_bao_encoded(len: ByteNum, range: Range<ByteNum>, slice: &[u8]) {
+        let mut offset = 0;
+        for item in SliceIter::new(len, range) {
+            if slice.len() < offset + item.size() {
+                println!("incomplete slice");
+                return;
+            }
+            match item {
+                StreamItem::Header => {
+                    let data = &slice[offset..offset + 8];
+                    println!(
+                        "header  {} {}",
+                        hex::encode(data),
+                        u64::from_le_bytes(data.try_into().unwrap())
+                    );
+                }
+                StreamItem::Hashes {
+                    left,
+                    right,
+                    is_root,
+                } => {
+                    let data = &slice[offset..offset + 64];
+                    let used = |b| if b { "*" } else { " " };
+                    println!("hashes root={}", is_root);
+                    println!("{} {}", hex::encode(&data[..32]), used(left));
+                    println!("{} {}", hex::encode(&data[32..]), used(right));
+                }
+                StreamItem::Data {
+                    start,
+                    size,
+                    is_root,
+                } => {
+                    let data = &slice[offset..offset + size];
+                    println!(
+                        "data range={}..{} root={}",
+                        start.to_usize(),
+                        start.to_usize() + size,
+                        is_root
+                    );
+                    for chunk in data.chunks(32) {
+                        println!("{}", hex::encode(chunk));
+                    }
+                }
+            }
+            println!("");
+            offset += item.size();
+        }
+    }
+}
+
+impl Iterator for SliceIter {
+    type Item = StreamItem;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.res.next()
+    }
 }
 
 #[derive(Debug)]
@@ -104,6 +160,8 @@ pub enum StreamItem {
         left: bool,
         /// the right hash will be relevant for later and needs to be pushed on the stack
         right: bool,
+        /// is this branch the root
+        is_root: bool,
     },
     /// you will get data for this range.
     /// you will need to verify this data against the hashes on the stack.
@@ -112,7 +170,9 @@ pub enum StreamItem {
         /// start of the range, this is a multiple of a chunk size
         start: ByteNum,
         /// size of the range, this is at most 2 chunks
-        size: usize
+        size: usize,
+        /// is this leaf the root
+        is_root: bool,
     },
 }
 
@@ -124,6 +184,128 @@ impl StreamItem {
             StreamItem::Data { size, .. } => *size,
         }
     }
+}
+
+pub struct SliceValidator<R> {
+    /// the inner reader
+    inner: R,
+    /// The slice iterator
+    ///
+    /// This is used to figure out what to expect from the reader.
+    /// It also provides info like the total length and the range.
+    iter: Result<SliceIter, Range<ByteNum>>,
+    // hash stack for validation
+    stack: Vec<blake3::Hash>,
+    // buffer for incomplete items
+    buf: [u8; 1024],
+}
+
+impl<R> SliceValidator<R> {
+    fn new(inner: R, range: Range<ByteNum>) -> Self {
+        Self {
+            inner,
+            iter: Err(range),
+            stack: vec![],
+            buf: [0; 1024],
+        }
+    }
+}
+
+impl<R: Read> SliceValidator<R> {
+    fn next0(&mut self) -> io::Result<Option<StreamItem>> {
+        // deal with the case where we don't yet have the header
+        let iter = match &mut self.iter {
+            Ok(iter) => iter,
+            Err(range) => {
+                // read the len
+                self.inner.read_exact(&mut self.buf[0..8])?;
+                let len = u64::from_le_bytes(self.buf[0..8].try_into().unwrap());
+                // switch to the mode where we have the len
+                let iter = SliceIter::new(ByteNum(len), range.clone());
+                // store and return the iter
+                self.iter = Ok(iter);
+                // return the header
+                return Ok(self.iter.as_mut().unwrap().next());
+            }
+        };
+
+        // get next item - if there is none, we are done
+        let item = match iter.peek() {
+            Some(item) => item,
+            None => return Ok(None),
+        };
+
+        // read the item, whatever it is. at this point it is either a hash or data
+        self.inner.read_exact(&mut self.buf[0..item.size()])?;
+        match item {
+            StreamItem::Hashes {
+                left,
+                right,
+                is_root,
+            } => {
+                let lc = blake3::Hash::from(<[u8; 32]>::try_from(&self.buf[0..32]).unwrap());
+                let rc = blake3::Hash::from(<[u8; 32]>::try_from(&self.buf[32..64]).unwrap());
+                let expected = self.stack.pop().unwrap();
+                let actual = blake3::guts::parent_cv(&lc, &rc, *is_root);
+                if expected != actual {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid branch hash",
+                    ));
+                }
+                if *left {
+                    self.stack.push(lc);
+                }
+                if *right {
+                    self.stack.push(rc);
+                }
+                Ok(iter.next())
+            }
+            StreamItem::Data {
+                start,
+                size,
+                is_root,
+            } => {
+                debug_assert!(start.0 % 1024 == 0);
+                let chunk = start.0 / 1024;
+                let mut hasher = blake3::guts::ChunkState::new(chunk);
+                hasher.update(&self.buf[0..*size]);
+                let expected = self.stack.pop().unwrap();
+                let actual = hasher.finalize(*is_root);
+                if expected != expected {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid leaf hash",
+                    ));
+                }
+                Ok(iter.next())
+            }
+            StreamItem::Header => {
+                unreachable!("we already handled the header")
+            }
+        }
+    }
+}
+
+impl<R: Read> Iterator for SliceValidator<R> {
+    type Item = io::Result<StreamItem>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next0().transpose()
+    }
+}
+
+pub struct BlockIter {
+    /// total len of the data in bytes
+    len: ByteNum,
+    /// start offset of the range we are interested in
+    start: ByteNum,
+    /// end offset of the range we are interested in
+    end: ByteNum,
+    // current offset
+    offset: NodeNum,
+    // done?
+    done: bool,
 }
 
 impl BlockIter {
@@ -158,24 +340,28 @@ impl Iterator for BlockIter {
             return None;
         }
         let position = BlockNum((self.offset.0 + 1) / 2);
+        let is_root = self.offset == root(self.blocks());
         if level(self.offset).0 > 0 {
             if self.end_block() <= position {
                 self.offset = left_child(self.offset).unwrap();
                 Some(StreamItem::Hashes {
                     left: true,
                     right: false,
+                    is_root,
                 })
             } else if self.start_block() >= position {
                 self.offset = right_descendant(self.offset, self.hashes()).unwrap();
                 Some(StreamItem::Hashes {
                     left: false,
                     right: true,
+                    is_root,
                 })
             } else {
                 self.offset = left_child(self.offset).unwrap();
                 Some(StreamItem::Hashes {
                     left: true,
                     right: true,
+                    is_root,
                 })
             }
         } else {
@@ -207,11 +393,15 @@ impl Iterator for BlockIter {
                 Some(offset) => self.offset = offset,
                 None => {
                     self.done = true;
-                },
+                }
             }
             let start = ByteNum(block.0 * 1024);
             let end = ByteNum((block.0 + size as u64) * 1024).min(self.len);
-            Some(StreamItem::Data { start, size: (end - start).to_usize() })
+            Some(StreamItem::Data {
+                start,
+                size: (end - start).to_usize(),
+                is_root,
+            })
         }
     }
 }
@@ -413,10 +603,7 @@ mod tests {
     use proptest::prelude::*;
     use std::io::{Cursor, Read};
 
-    pub fn print_block_seqence(
-        len: ByteNum,
-        range: Range<ByteNum>,
-    ) {
+    pub fn print_block_seqence(len: ByteNum, range: Range<ByteNum>) {
         let mut range = range;
         // map the range to our real range
         range.start = range.start.min(len);
@@ -433,7 +620,7 @@ mod tests {
         }
 
         println!("****");
-        for item in slice_parts(len, range) {
+        for item in SliceIter::new(len, range) {
             println!("{:?}", item);
         }
     }
@@ -487,7 +674,7 @@ mod tests {
         // need to skip the length prefix
         let content = &slice[8..];
         print_blake(&slice);
-        print_slice_2(len, slice_start..slice_start + slice_len, &slice);
+        SliceIter::print_bao_encoded(len, slice_start..slice_start + slice_len, &slice);
         // create an inner decoder to decode the entire slice
         let mut decoder = DecoderInner::for_range(
             Cursor::new(&content),
