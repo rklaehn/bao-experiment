@@ -201,13 +201,18 @@ pub struct SliceValidator<R> {
 }
 
 impl<R> SliceValidator<R> {
-    fn new(inner: R, range: Range<ByteNum>) -> Self {
+    fn new(inner: R, hash: blake3::Hash, start: u64, len: u64) -> Self {
+        let range = start..start.saturating_add(len);
         Self {
             inner,
-            iter: Err(range),
-            stack: vec![],
+            iter: Err(ByteNum(range.start)..ByteNum(range.end)),
+            stack: vec![hash],
             buf: [0; 1024],
         }
+    }
+
+    fn into_inner(self) -> R {
+        self.inner
     }
 }
 
@@ -235,6 +240,10 @@ impl<R: Read> SliceValidator<R> {
             None => return Ok(None),
         };
 
+        if self.stack.is_empty() {
+            return Ok(None);
+        }
+
         // read the item, whatever it is. at this point it is either a hash or data
         self.inner.read_exact(&mut self.buf[0..item.size()])?;
         match item {
@@ -253,11 +262,12 @@ impl<R: Read> SliceValidator<R> {
                         "invalid branch hash",
                     ));
                 }
-                if *left {
-                    self.stack.push(lc);
-                }
+                // push the hashes on the stack in *reverse* order
                 if *right {
                     self.stack.push(rc);
+                }
+                if *left {
+                    self.stack.push(lc);
                 }
                 Ok(iter.next())
             }
@@ -599,6 +609,7 @@ fn print_blake(data: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bao::decode::SliceDecoder;
     use bao::encode::SliceExtractor;
     use proptest::prelude::*;
     use std::io::{Cursor, Read};
@@ -662,6 +673,18 @@ mod tests {
         assert_eq!(cursor.position(), content.len() as u64);
     }
 
+    fn test_decode_all_impl_2(len: ByteNum) {
+        // create a slice encoding the entire data - equivalent to the bao inline encoding
+        let (hash, slice) = encode_slice(&create_test_data(len.to_usize()), 0, len.0);
+        let mut read = Cursor::new(&slice);
+        let validator = SliceValidator::new(&mut read, hash, 0, len.0);
+        for item in validator {
+            assert!(item.is_ok());
+        }
+        // check that we have read the entire slice
+        assert_eq!(read.position(), slice.len() as u64);
+    }
+
     fn test_decode_part_impl(len: ByteNum, slice_start: ByteNum, slice_len: ByteNum) {
         // we need to be at block level 0 to be compatible with bao
         let block_level = BlockLevel(0);
@@ -695,6 +718,23 @@ mod tests {
         assert_eq!(cursor.position(), content.len() as u64);
     }
 
+    fn test_decode_part_impl_2(len: ByteNum, slice_start: ByteNum, slice_len: ByteNum) {
+        // create a slice encoding the given range
+        let (hash, slice) = encode_slice(
+            &create_test_data(len.to_usize()),
+            slice_start.0,
+            slice_len.0,
+        );
+        // SliceIter::print_bao_encoded(len, slice_start..slice_start + slice_len, &slice);
+        // create an inner decoder to decode the entire slice
+        let mut reader = Cursor::new(&slice);
+        let validator = SliceValidator::new(&mut reader, hash, slice_start.0, slice_len.0);
+        for item in validator {
+            assert!(item.is_ok());
+        }
+        assert_eq!(reader.position(), slice.len() as u64);
+    }
+
     fn size_start_len() -> impl Strategy<Value = (ByteNum, ByteNum, ByteNum)> {
         (0u64..65536)
             .prop_flat_map(|size| {
@@ -713,18 +753,23 @@ mod tests {
     proptest! {
         #[test]
         fn test_decode_all(size in 1usize..32768) {
-            test_decode_all_impl(ByteNum(size as u64));
+            let len = ByteNum(size as u64);
+            test_decode_all_impl(len);
+            test_decode_all_impl_2(len);
         }
 
         #[test]
         fn test_decode_part((size, start, len) in size_start_len()) {
             test_decode_part_impl(size, start, len);
+            test_decode_part_impl_2(size, start, len);
         }
     }
 
     #[test]
     fn test_decode_all_1() {
-        test_decode_all_impl(ByteNum(1234456));
+        let len = ByteNum(12343465);
+        test_decode_all_impl(len);
+        test_decode_all_impl_2(len);
     }
 
     #[test]
