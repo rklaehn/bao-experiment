@@ -61,9 +61,9 @@ impl SliceIter {
                     let end = (start + 1024).min(self.len);
                     self.res.push(StreamItem::Data {
                         start,
-                        size: (end - start).to_usize(),
+                        end,
                         is_root,
-                    })
+                    });
                 }
             }
         }
@@ -120,9 +120,10 @@ impl SliceIter {
                 }
                 StreamItem::Data {
                     start,
-                    size,
+                    end,
                     is_root,
                 } => {
+                    let size = end.to_usize() - start.to_usize();
                     let data = &slice[offset..offset + size];
                     println!(
                         "data range={}..{} root={}",
@@ -167,10 +168,10 @@ pub enum StreamItem {
     /// you will need to verify this data against the hashes on the stack.
     /// the data to be actually returned can be just a subset of this.
     Data {
-        /// start of the range, this is a multiple of a chunk size
+        /// start of the range
         start: ByteNum,
-        /// size of the range, this is at most 2 chunks
-        size: usize,
+        /// end of the range
+        end: ByteNum,
         /// is this leaf the root
         is_root: bool,
     },
@@ -181,8 +182,12 @@ impl StreamItem {
         match self {
             StreamItem::Header => 8,
             StreamItem::Hashes { .. } => 64,
-            StreamItem::Data { size, .. } => *size,
+            StreamItem::Data { start, end, .. } => end.to_usize() - start.to_usize(),
         }
+    }
+
+    pub fn is_data(&self) -> bool {
+        matches!(self, StreamItem::Data { .. })
     }
 }
 
@@ -214,9 +219,40 @@ impl<R> SliceValidator<R> {
     fn into_inner(self) -> R {
         self.inner
     }
+
+    fn range(&self) -> &Range<ByteNum> {
+        match &self.iter {
+            Ok(iter) => &iter.range,
+            Err(range) => range,
+        }
+    }
 }
 
 impl<R: Read> SliceValidator<R> {
+    fn get_buffer(&self, item: &StreamItem) -> &[u8] {
+        match item {
+            StreamItem::Header => &self.buf[0..8],
+            StreamItem::Hashes { .. } => &self.buf[0..64],
+            StreamItem::Data {
+                mut start, mut end, ..
+            } => {
+                let range = self.range();
+                let start1 = start.max(range.start);
+                let end1 = end.min(range.end);
+                let start2 = start1.to_usize() - start.to_usize();
+                let end2 = end1.to_usize() - start.to_usize();
+                &self.buf[start2..end2]
+            }
+        }
+    }
+
+    fn peek(&mut self) -> Option<&StreamItem> {
+        match self.iter {
+            Ok(ref mut iter) => iter.peek(),
+            Err(_) => Some(&StreamItem::Header),
+        }
+    }
+
     fn next0(&mut self) -> io::Result<Option<StreamItem>> {
         // deal with the case where we don't yet have the header
         let iter = match &mut self.iter {
@@ -239,10 +275,6 @@ impl<R: Read> SliceValidator<R> {
             Some(item) => item,
             None => return Ok(None),
         };
-
-        if self.stack.is_empty() {
-            return Ok(None);
-        }
 
         // read the item, whatever it is. at this point it is either a hash or data
         self.inner.read_exact(&mut self.buf[0..item.size()])?;
@@ -273,16 +305,17 @@ impl<R: Read> SliceValidator<R> {
             }
             StreamItem::Data {
                 start,
-                size,
+                end,
                 is_root,
             } => {
                 debug_assert!(start.0 % 1024 == 0);
                 let chunk = start.0 / 1024;
                 let mut hasher = blake3::guts::ChunkState::new(chunk);
-                hasher.update(&self.buf[0..*size]);
+                let size = end.to_usize() - start.to_usize();
+                hasher.update(&self.buf[0..size]);
                 let expected = self.stack.pop().unwrap();
                 let actual = hasher.finalize(*is_root);
-                if expected != expected {
+                if expected != actual {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "invalid leaf hash",
@@ -302,6 +335,63 @@ impl<R: Read> Iterator for SliceValidator<R> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next0().transpose()
+    }
+}
+
+struct SliceReader<R> {
+    inner: SliceValidator<R>,
+    current_item: Option<StreamItem>,
+    buf_start: usize,
+}
+
+impl<R: Read> SliceReader<R> {
+    fn new(inner: R, hash: blake3::Hash, start: u64, len: u64) -> Self {
+        Self {
+            inner: SliceValidator::new(inner, hash, start, len),
+            current_item: None,
+            buf_start: 0,
+        }
+    }
+
+    fn into_inner(self) -> R {
+        self.inner.into_inner()
+    }
+}
+
+impl<R: Read> Read for SliceReader<R> {
+    fn read(&mut self, tgt: &mut [u8]) -> io::Result<usize> {
+        loop {
+            // if we have no current item, get the next one
+            if self.current_item.is_none() {
+                self.current_item = match self.inner.next().transpose()? {
+                    Some(item) if item.is_data() => Some(item),
+                    Some(_) => continue,
+                    None => return Ok(0),
+                };
+                self.buf_start = 0;
+            }
+
+            // if we get here we we have a data item.
+            // but it does not really matter
+            let item = self.current_item.as_ref().unwrap();
+            let src = self.inner.get_buffer(item);
+            if src.is_empty() {
+                self.current_item = None;
+                self.buf_start = 0;
+                continue;
+            }
+            let n = (src.len() - self.buf_start).min(tgt.len());
+            let end = self.buf_start + n;
+            tgt[0..n].copy_from_slice(&src[self.buf_start..end]);
+            if end < src.len() {
+                self.buf_start = end;
+            } else {
+                self.current_item = None;
+                self.buf_start = 0;
+            }
+            debug_assert!(n > 0, "we should have read something");
+            break Ok(n);
+        }
     }
 }
 
@@ -409,7 +499,7 @@ impl Iterator for BlockIter {
             let end = ByteNum((block.0 + size as u64) * 1024).min(self.len);
             Some(StreamItem::Data {
                 start,
-                size: (end - start).to_usize(),
+                end,
                 is_root,
             })
         }
@@ -675,64 +765,54 @@ mod tests {
 
     fn test_decode_all_impl_2(len: ByteNum) {
         // create a slice encoding the entire data - equivalent to the bao inline encoding
-        let (hash, slice) = encode_slice(&create_test_data(len.to_usize()), 0, len.0);
-        let mut read = Cursor::new(&slice);
-        let validator = SliceValidator::new(&mut read, hash, 0, len.0);
+        let test_data = create_test_data(len.to_usize());
+        let (hash, slice) = encode_slice(&test_data, 0, len.0);
+
+        // test just validation without reading
+        let mut cursor = Cursor::new(&slice);
+        let validator = SliceValidator::new(&mut cursor, hash, 0, len.0);
         for item in validator {
             assert!(item.is_ok());
         }
         // check that we have read the entire slice
-        assert_eq!(read.position(), slice.len() as u64);
-    }
+        assert_eq!(cursor.position(), slice.len() as u64);
 
-    fn test_decode_part_impl(len: ByteNum, slice_start: ByteNum, slice_len: ByteNum) {
-        // we need to be at block level 0 to be compatible with bao
-        let block_level = BlockLevel(0);
-        // create a slice encoding the given range
-        let (hash, slice) = encode_slice(
-            &create_test_data(len.to_usize()),
-            slice_start.0,
-            slice_len.0,
-        );
-        // need to skip the length prefix
-        let content = &slice[8..];
-        print_blake(&slice);
-        SliceIter::print_bao_encoded(len, slice_start..slice_start + slice_len, &slice);
-        // create an inner decoder to decode the entire slice
-        let mut decoder = DecoderInner::for_range(
-            Cursor::new(&content),
-            hash,
-            len,
-            slice_start..slice_start + slice_len,
-            block_level,
-        );
-        // advance until there is nothing left
-        loop {
-            let n = decoder.advance().unwrap();
-            if n == 0 {
-                break;
-            }
-        }
+        // test validation and reading
+        let mut cursor = Cursor::new(&slice);
+        let mut reader = SliceReader::new(&mut cursor, hash, 0, len.0);
+        let mut data = vec![];
+        reader.read_to_end(&mut data).unwrap();
+        assert_eq!(data, test_data);
+
         // check that we have read the entire slice
-        let cursor = decoder.into_inner();
-        assert_eq!(cursor.position(), content.len() as u64);
+        assert_eq!(cursor.position(), slice.len() as u64);
     }
 
     fn test_decode_part_impl_2(len: ByteNum, slice_start: ByteNum, slice_len: ByteNum) {
+        let test_data = create_test_data(len.to_usize());
         // create a slice encoding the given range
-        let (hash, slice) = encode_slice(
-            &create_test_data(len.to_usize()),
-            slice_start.0,
-            slice_len.0,
-        );
+        let (hash, slice) = encode_slice(&test_data, slice_start.0, slice_len.0);
         // SliceIter::print_bao_encoded(len, slice_start..slice_start + slice_len, &slice);
+
         // create an inner decoder to decode the entire slice
-        let mut reader = Cursor::new(&slice);
-        let validator = SliceValidator::new(&mut reader, hash, slice_start.0, slice_len.0);
+        let mut cursor = Cursor::new(&slice);
+        let validator = SliceValidator::new(&mut cursor, hash, slice_start.0, slice_len.0);
         for item in validator {
             assert!(item.is_ok());
         }
-        assert_eq!(reader.position(), slice.len() as u64);
+        // check that we have read the entire slice
+        assert_eq!(cursor.position(), slice.len() as u64);
+
+        let mut cursor = Cursor::new(&slice);
+        let mut reader = SliceReader::new(&mut cursor, hash, slice_start.0, slice_len.0);
+        let mut data = vec![];
+        reader.read_to_end(&mut data).unwrap();
+        // check that we have read the entire slice
+        assert_eq!(cursor.position(), slice.len() as u64);
+        // check that we have read the correct data
+        let start = slice_start.min(len).to_usize();
+        let end = (slice_start + slice_len).min(len).to_usize();
+        assert_eq!(data, test_data[start..end]);
     }
 
     fn size_start_len() -> impl Strategy<Value = (ByteNum, ByteNum, ByteNum)> {
@@ -754,13 +834,13 @@ mod tests {
         #[test]
         fn test_decode_all(size in 1usize..32768) {
             let len = ByteNum(size as u64);
-            test_decode_all_impl(len);
+            // test_decode_all_impl(len);
             test_decode_all_impl_2(len);
         }
 
         #[test]
         fn test_decode_part((size, start, len) in size_start_len()) {
-            test_decode_part_impl(size, start, len);
+            // test_decode_part_impl(size, start, len);
             test_decode_part_impl_2(size, start, len);
         }
     }
@@ -768,7 +848,7 @@ mod tests {
     #[test]
     fn test_decode_all_1() {
         let len = ByteNum(12343465);
-        test_decode_all_impl(len);
+        // test_decode_all_impl(len);
         test_decode_all_impl_2(len);
     }
 
@@ -782,26 +862,31 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_part_0() {
+        test_decode_part_impl_2(ByteNum(1), ByteNum(0), ByteNum(0));
+    }
+
+    #[test]
     fn test_decode_part_1() {
-        test_decode_part_impl(ByteNum(2048), ByteNum(0), ByteNum(1024));
-        test_decode_part_impl(ByteNum(2048), ByteNum(1024), ByteNum(1024));
-        test_decode_part_impl(ByteNum(4096), ByteNum(0), ByteNum(1024));
-        test_decode_part_impl(ByteNum(4096), ByteNum(1024), ByteNum(1024));
+        test_decode_part_impl_2(ByteNum(2048), ByteNum(0), ByteNum(1024));
+        test_decode_part_impl_2(ByteNum(2048), ByteNum(1024), ByteNum(1024));
+        test_decode_part_impl_2(ByteNum(4096), ByteNum(0), ByteNum(1024));
+        test_decode_part_impl_2(ByteNum(4096), ByteNum(1024), ByteNum(1024));
     }
 
     #[test]
     fn test_decode_part_2() {
-        test_decode_part_impl(ByteNum(548), ByteNum(520), ByteNum(505));
+        test_decode_part_impl_2(ByteNum(548), ByteNum(520), ByteNum(505));
     }
 
     #[test]
     fn test_decode_part_3() {
-        test_decode_part_impl(ByteNum(2126), ByteNum(2048), ByteNum(1));
+        test_decode_part_impl_2(ByteNum(2126), ByteNum(2048), ByteNum(1));
     }
 
     #[test]
     fn test_decode_part_4() {
-        test_decode_part_impl(ByteNum(3073), ByteNum(1024), ByteNum(1025));
+        test_decode_part_impl_2(ByteNum(3073), ByteNum(1024), ByteNum(1025));
     }
 
     #[test]
