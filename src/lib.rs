@@ -1,3 +1,8 @@
+//! An implementation of the bao SliceDecoder allowing both sync and async usage
+//! 
+//! this is a stripped down version of a crate that does the blake3 outboard in
+//! traversal order, whereas the bao crate itself does it in post-order and then
+//! flips to pre-order.
 use futures::{ready, AsyncRead, Stream, StreamExt};
 
 use blake3::guts::CHUNK_LEN;
@@ -21,11 +26,13 @@ fn level(offset: NodeNum) -> u32 {
     (!offset).trailing_zeros()
 }
 
+/// number of blocks, given a size in bytes
 fn blocks(len: u64) -> BlockNum {
     const BLOCK_SIZE: u64 = CHUNK_LEN as u64;
     len / BLOCK_SIZE + if len % BLOCK_SIZE == 0 { 0 } else { 1 }
 }
 
+/// number of hashes (leaf or branch) given a number of blocks
 fn num_hashes(blocks: BlockNum) -> NodeNum {
     if blocks > 0 {
         blocks * 2 - 1
@@ -34,10 +41,12 @@ fn num_hashes(blocks: BlockNum) -> NodeNum {
     }
 }
 
+/// span of an offset - 1 for leaf nodes
 fn span(offset: NodeNum) -> NodeNum {
-    1 << (!offset).trailing_zeros()
+    1 << level(offset)
 }
 
+/// left child of a node
 fn left_child(offset: NodeNum) -> Option<NodeNum> {
     let span = span(offset);
     if span == 1 {
@@ -47,6 +56,7 @@ fn left_child(offset: NodeNum) -> Option<NodeNum> {
     }
 }
 
+/// right child of a node
 fn right_child(offset: NodeNum) -> Option<NodeNum> {
     let span = span(offset);
     if span == 1 {
@@ -56,7 +66,7 @@ fn right_child(offset: NodeNum) -> Option<NodeNum> {
     }
 }
 
-/// Get a valid right descendant for an offset
+/// valid right descendant for an offset
 fn right_descendant(offset: NodeNum, len: NodeNum) -> Option<NodeNum> {
     let mut offset = right_child(offset)?;
     while offset >= len {
@@ -203,6 +213,8 @@ pub enum StreamItem {
 }
 
 impl StreamItem {
+
+    /// size of the stream item in bytes, at most CHUNK_LEN
     pub fn size(&self) -> usize {
         match self {
             StreamItem::Header => 8,
