@@ -46,13 +46,13 @@ impl SliceIter {
         range.end = range.end.min(len);
         impl State {
             fn hashes(&self) -> NodeNum {
-                num_hashes(blocks(ByteNum(self.len), BlockLevel(0)))
+                num_hashes(blocks(self.len))
             }
 
-            fn traverse(&mut self, offset: NodeNum) {
-                let position = (offset.0 + 1) / 2 * 1024;
-                let is_root = offset == root(blocks(ByteNum(self.len), BlockLevel(0)));
-                if level(offset).0 > 0 {
+            fn traverse(&mut self, offset: u64) {
+                let position = (offset + 1) / 2 * 1024;
+                let is_root = offset == root(blocks(self.len));
+                if level(offset) > 0 {
                     let (left, right) = if self.range.end <= position {
                         (true, false)
                     } else if self.range.start >= position {
@@ -87,7 +87,7 @@ impl SliceIter {
             range,
             res: vec![],
         };
-        state.traverse(root(blocks(ByteNum(len), BlockLevel(0))));
+        state.traverse(root(blocks(len)));
         state.res
     }
 
@@ -513,14 +513,14 @@ mod tests {
     }
 
     /// Test implementation for the test_decode_all test, to be called by both proptest and hardcoded tests
-    fn test_decode_all_impl(len: ByteNum) {
+    fn test_decode_all_impl(len: u64) {
         // create a slice encoding the entire data - equivalent to the bao inline encoding
-        let test_data = create_test_data(len.to_usize());
-        let (hash, slice) = encode_slice(&test_data, 0, len.0);
+        let test_data = create_test_data(len as usize);
+        let (hash, slice) = encode_slice(&test_data, 0, len);
 
         // test just validation without reading
         let mut cursor = Cursor::new(&slice);
-        let validator = SliceValidator::new(&mut cursor, hash, 0, len.0);
+        let validator = SliceValidator::new(&mut cursor, hash, 0, len);
         for item in validator {
             assert!(item.is_ok());
         }
@@ -529,7 +529,7 @@ mod tests {
 
         // test validation and reading
         let mut cursor = Cursor::new(&slice);
-        let mut reader = SliceReader::new(&mut cursor, hash, 0, len.0);
+        let mut reader = SliceReader::new(&mut cursor, hash, 0, len);
         let mut data = vec![];
         reader.read_to_end(&mut data).unwrap();
         assert_eq!(data, test_data);
@@ -539,14 +539,14 @@ mod tests {
     }
 
     /// Test implementation for the test_decode_all test, to be called by both proptest and hardcoded tests
-    async fn test_decode_all_async_impl(len: ByteNum) {
+    async fn test_decode_all_async_impl(len: u64) {
         // create a slice encoding the entire data - equivalent to the bao inline encoding
-        let test_data = create_test_data(len.to_usize());
-        let (hash, slice) = encode_slice(&test_data, 0, len.0);
+        let test_data = create_test_data(len as usize);
+        let (hash, slice) = encode_slice(&test_data, 0, len);
 
         // test just validation without reading
         let mut cursor = futures::io::Cursor::new(&slice);
-        let mut validator = SliceValidator::new(&mut cursor, hash, 0, len.0);
+        let mut validator = SliceValidator::new(&mut cursor, hash, 0, len);
         while let Some(item) = validator.next().await {
             assert!(item.is_ok());
         }
@@ -555,7 +555,7 @@ mod tests {
 
         // test validation and reading
         let mut cursor = futures::io::Cursor::new(&slice);
-        let mut reader = SliceReader::new(&mut cursor, hash, 0, len.0);
+        let mut reader = SliceReader::new(&mut cursor, hash, 0, len);
         let mut data = vec![];
         reader.read_to_end(&mut data).await.unwrap();
         assert_eq!(data, test_data);
@@ -565,15 +565,15 @@ mod tests {
     }
 
     /// Test implementation for the test_decode_part test, to be called by both proptest and hardcoded tests
-    fn test_decode_part_impl(len: ByteNum, slice_start: ByteNum, slice_len: ByteNum) {
-        let test_data = create_test_data(len.to_usize());
+    fn test_decode_part_impl(len: u64, slice_start: u64, slice_len: u64) {
+        let test_data = create_test_data(len as usize);
         // create a slice encoding the given range
-        let (hash, slice) = encode_slice(&test_data, slice_start.0, slice_len.0);
+        let (hash, slice) = encode_slice(&test_data, slice_start, slice_len);
         // SliceIter::print_bao_encoded(len, slice_start..slice_start + slice_len, &slice);
 
         // create an inner decoder to decode the entire slice
         let mut cursor = Cursor::new(&slice);
-        let validator = SliceValidator::new(&mut cursor, hash, slice_start.0, slice_len.0);
+        let validator = SliceValidator::new(&mut cursor, hash, slice_start, slice_len);
         for item in validator {
             assert!(item.is_ok());
         }
@@ -581,27 +581,27 @@ mod tests {
         assert_eq!(cursor.position(), slice.len() as u64);
 
         let mut cursor = Cursor::new(&slice);
-        let mut reader = SliceReader::new(&mut cursor, hash, slice_start.0, slice_len.0);
+        let mut reader = SliceReader::new(&mut cursor, hash, slice_start, slice_len);
         let mut data = vec![];
         reader.read_to_end(&mut data).unwrap();
         // check that we have read the entire slice
         assert_eq!(cursor.position(), slice.len() as u64);
         // check that we have read the correct data
-        let start = slice_start.min(len).to_usize();
-        let end = (slice_start + slice_len).min(len).to_usize();
+        let start = slice_start.min(len) as usize;
+        let end = (slice_start + slice_len).min(len) as usize;
         assert_eq!(data, test_data[start..end]);
     }
 
     /// Test implementation for the test_decode_part test, to be called by both proptest and hardcoded tests
-    async fn test_decode_part_async_impl(len: ByteNum, slice_start: ByteNum, slice_len: ByteNum) {
-        let test_data = create_test_data(len.to_usize());
+    async fn test_decode_part_async_impl(len: u64, slice_start: u64, slice_len: u64) {
+        let test_data = create_test_data(len as usize);
         // create a slice encoding the given range
-        let (hash, slice) = encode_slice(&test_data, slice_start.0, slice_len.0);
+        let (hash, slice) = encode_slice(&test_data, slice_start, slice_len);
         // SliceIter::print_bao_encoded(len, slice_start..slice_start + slice_len, &slice);
 
         // create an inner decoder to decode the entire slice
         let mut cursor = futures::io::Cursor::new(&slice);
-        let mut validator = SliceValidator::new(&mut cursor, hash, slice_start.0, slice_len.0);
+        let mut validator = SliceValidator::new(&mut cursor, hash, slice_start, slice_len);
         while let Some(item) = validator.next().await {
             assert!(item.is_ok());
         }
@@ -609,37 +609,29 @@ mod tests {
         assert_eq!(cursor.position(), slice.len() as u64);
 
         let mut cursor = futures::io::Cursor::new(&slice);
-        let mut reader = SliceReader::new(&mut cursor, hash, slice_start.0, slice_len.0);
+        let mut reader = SliceReader::new(&mut cursor, hash, slice_start, slice_len);
         let mut data = vec![];
         reader.read_to_end(&mut data).await.unwrap();
         // check that we have read the entire slice
         assert_eq!(cursor.position(), slice.len() as u64);
         // check that we have read the correct data
-        let start = slice_start.min(len).to_usize();
-        let end = (slice_start + slice_len).min(len).to_usize();
+        let start = slice_start.min(len) as usize;
+        let end = (slice_start + slice_len).min(len) as usize;
         assert_eq!(data, test_data[start..end]);
     }
 
     /// Generate a random size, start and len
-    fn size_start_len() -> impl Strategy<Value = (ByteNum, ByteNum, ByteNum)> {
-        (0u64..65536)
-            .prop_flat_map(|size| {
-                let start = 0u64..size;
-                let len = 0u64..size;
-                (Just(size), start, len)
-            })
-            .prop_map(|(size, start, len)| {
-                let size = ByteNum(size);
-                let start = ByteNum(start);
-                let len = ByteNum(len);
-                (size, start, len)
-            })
+    fn size_start_len() -> impl Strategy<Value = (u64, u64, u64)> {
+        (0u64..65536).prop_flat_map(|size| {
+            let start = 0u64..size;
+            let len = 0u64..size;
+            (Just(size), start, len)
+        })
     }
 
     proptest! {
         #[test]
-        fn test_decode_all(size in 1usize..32768) {
-            let len = ByteNum(size as u64);
+        fn test_decode_all(len in 1u64..32768) {
             // test_decode_all_impl(len);
             test_decode_all_impl(len);
             futures::executor::block_on(test_decode_all_async_impl(len));
@@ -655,60 +647,60 @@ mod tests {
 
     #[test]
     fn test_decode_all_1() {
-        let len = ByteNum(12343465);
+        let len = 12343465;
         // test_decode_all_impl(len);
         test_decode_all_impl(len);
     }
 
     #[tokio::test]
     async fn test_decode_all_async_1() {
-        let len = ByteNum(12343465);
+        let len = 12343465;
         // test_decode_all_impl(len);
         test_decode_all_async_impl(len).await;
     }
 
     #[test]
     fn test_decode_all_2() {
-        test_decode_all_impl(ByteNum(0));
-        test_decode_all_impl(ByteNum(1));
-        test_decode_all_impl(ByteNum(1024));
-        test_decode_all_impl(ByteNum(1025));
-        test_decode_all_impl(ByteNum(2049));
+        test_decode_all_impl((0));
+        test_decode_all_impl((1));
+        test_decode_all_impl((1024));
+        test_decode_all_impl((1025));
+        test_decode_all_impl((2049));
     }
 
     #[test]
     fn test_decode_part_0() {
-        test_decode_part_impl(ByteNum(1), ByteNum(0), ByteNum(0));
+        test_decode_part_impl((1), (0), (0));
     }
 
     #[test]
     fn test_decode_part_1() {
-        test_decode_part_impl(ByteNum(2048), ByteNum(0), ByteNum(1024));
-        test_decode_part_impl(ByteNum(2048), ByteNum(1024), ByteNum(1024));
-        test_decode_part_impl(ByteNum(4096), ByteNum(0), ByteNum(1024));
-        test_decode_part_impl(ByteNum(4096), ByteNum(1024), ByteNum(1024));
+        test_decode_part_impl((2048), (0), (1024));
+        test_decode_part_impl((2048), (1024), (1024));
+        test_decode_part_impl((4096), (0), (1024));
+        test_decode_part_impl((4096), (1024), (1024));
     }
 
     #[tokio::test]
     async fn test_decode_part_async_1() {
-        test_decode_part_async_impl(ByteNum(2048), ByteNum(0), ByteNum(1024)).await;
-        test_decode_part_async_impl(ByteNum(2048), ByteNum(1024), ByteNum(1024)).await;
-        test_decode_part_async_impl(ByteNum(4096), ByteNum(0), ByteNum(1024)).await;
-        test_decode_part_async_impl(ByteNum(4096), ByteNum(1024), ByteNum(1024)).await;
+        test_decode_part_async_impl((2048), (0), (1024)).await;
+        test_decode_part_async_impl((2048), (1024), (1024)).await;
+        test_decode_part_async_impl((4096), (0), (1024)).await;
+        test_decode_part_async_impl((4096), (1024), (1024)).await;
     }
 
     #[test]
     fn test_decode_part_2() {
-        test_decode_part_impl(ByteNum(548), ByteNum(520), ByteNum(505));
+        test_decode_part_impl((548), (520), (505));
     }
 
     #[test]
     fn test_decode_part_3() {
-        test_decode_part_impl(ByteNum(2126), ByteNum(2048), ByteNum(1));
+        test_decode_part_impl((2126), (2048), (1));
     }
 
     #[test]
     fn test_decode_part_4() {
-        test_decode_part_impl(ByteNum(3073), ByteNum(1024), ByteNum(1025));
+        test_decode_part_impl((3073), (1024), (1025));
     }
 }

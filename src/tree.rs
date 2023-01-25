@@ -94,13 +94,6 @@ macro_rules! index_newtype {
     }
 }
 
-index_newtype! {
-    /// A number of nodes in the tree
-    ///
-    /// When used as an index, even numbers correspond to leaf nodes, odd numbers to branch nodes.
-    pub struct NodeNum(pub u64);
-}
-
 pub(crate) const BLAKE3_CHUNK_SIZE: u64 = 1024;
 
 index_newtype! {
@@ -108,44 +101,16 @@ index_newtype! {
     pub struct BlockNum(pub u64);
 }
 
-impl BlockNum {
-    pub fn to_bytes(self, block_level: BlockLevel) -> ByteNum {
-        let block_size = block_size(block_level);
-        ByteNum(self.0 * block_size.0)
-    }
-}
-
-index_newtype! {
-    /// A number of bytes
-    pub struct ByteNum(pub u64);
-}
-
-/// A block level. 0 means that a block corresponds to a blake3 chunk,
-/// otherwise the block size is 2^block_level * 1024 bytes.
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BlockLevel(pub u32);
-
 /// A tree level. 0 is for leaves, 1 is for the first level of branches, etc.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TreeLevel(pub u32);
 
-pub(crate) fn block_size(block_level: BlockLevel) -> ByteNum {
-    ByteNum(block_size0(block_level.0))
-}
-
-fn block_size0(block_level: u32) -> u64 {
-    BLAKE3_CHUNK_SIZE << block_level
-}
-
-pub(crate) fn leafs(blocks: NodeNum) -> BlockNum {
-    BlockNum((blocks.0 + 1) / 2)
-}
+pub type NodeNum = u64;
 
 /// Root offset given a number of leaves.
 pub(crate) fn root(leafs: BlockNum) -> NodeNum {
-    NodeNum(root0(leafs.0))
+    root0(leafs.0)
 }
 
 fn root0(leafs: u64) -> u64 {
@@ -153,25 +118,25 @@ fn root0(leafs: u64) -> u64 {
 }
 
 /// Level for an offset. 0 is for leaves, 1 is for the first level of branches, etc.
-pub(crate) fn level(offset: NodeNum) -> TreeLevel {
-    TreeLevel(level0(offset.0))
+pub(crate) fn level(offset: NodeNum) -> u32 {
+    level0(offset)
 }
 
 fn level0(offset: u64) -> u32 {
     (!offset).trailing_zeros()
 }
 
-pub(crate) fn blocks(len: ByteNum, block_level: BlockLevel) -> BlockNum {
-    BlockNum(blocks0(len.0, block_level.0))
+pub(crate) fn blocks(len: u64) -> BlockNum {
+    BlockNum(blocks0(len))
 }
 
-fn blocks0(len: u64, block_level: u32) -> u64 {
-    let block_size = block_size0(block_level);
+fn blocks0(len: u64) -> u64 {
+    let block_size = 1024;
     len / block_size + if len % block_size == 0 { 0 } else { 1 }
 }
 
 pub(crate) fn num_hashes(blocks: BlockNum) -> NodeNum {
-    NodeNum(num_hashes0(blocks.0))
+    num_hashes0(blocks.0)
 }
 
 fn num_hashes0(blocks: u64) -> u64 {
@@ -182,20 +147,11 @@ fn num_hashes0(blocks: u64) -> u64 {
     }
 }
 
-/// Span for an offset. 1 is for leaves, 2 is for the first level of branches, etc.
-pub(crate) fn span(offset: NodeNum) -> NodeNum {
-    NodeNum(span0(offset.0))
-}
-
 fn span0(offset: u64) -> u64 {
     1 << (!offset).trailing_zeros()
 }
 
-pub(crate) fn left_child(offset: NodeNum) -> Option<NodeNum> {
-    left_child0(offset.0).map(NodeNum)
-}
-
-fn left_child0(offset: u64) -> Option<u64> {
+pub fn left_child(offset: NodeNum) -> Option<NodeNum> {
     let span = span0(offset);
     if span == 1 {
         None
@@ -205,10 +161,6 @@ fn left_child0(offset: u64) -> Option<u64> {
 }
 
 fn right_child(offset: NodeNum) -> Option<NodeNum> {
-    right_child0(offset.0).map(NodeNum)
-}
-
-fn right_child0(offset: u64) -> Option<u64> {
     let span = span0(offset);
     if span == 1 {
         None
@@ -228,12 +180,12 @@ pub(crate) fn right_descendant(offset: NodeNum, len: NodeNum) -> Option<NodeNum>
 
 /// Get the chunk index for an offset
 pub(crate) fn index(offset: NodeNum) -> BlockNum {
-    BlockNum(offset.0 / 2)
+    BlockNum(offset / 2)
 }
 
 pub(crate) fn range(offset: NodeNum) -> Range<NodeNum> {
-    let r = range0(offset.0);
-    NodeNum(r.start)..NodeNum(r.end)
+    let r = range0(offset);
+    r.start..r.end
 }
 
 fn range0(offset: u64) -> Range<u64> {
@@ -249,22 +201,13 @@ mod tests {
 
     use super::*;
 
-    impl Arbitrary for NodeNum {
-        type Parameters = ();
-        type Strategy = BoxedStrategy<NodeNum>;
-
-        fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-            any::<u64>().prop_map(NodeNum).boxed()
-        }
-    }
-
     #[test]
     fn test_right_descendant() {
         for i in 1..11 {
             println!(
                 "valid_right_child({}, 9), {:?}",
                 i,
-                right_descendant(NodeNum(i), NodeNum(9))
+                right_descendant(i, 9)
             );
         }
     }
