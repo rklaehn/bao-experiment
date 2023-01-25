@@ -8,22 +8,14 @@ use std::{
     task::{Context, Poll},
 };
 
-struct SliceIter {
-    len: ByteNum,
-    range: Range<ByteNum>,
+pub struct SliceIter {
+    len: u64,
+    range: Range<u64>,
     res: Option<std::iter::Peekable<std::vec::IntoIter<StreamItem>>>,
 }
 
 impl SliceIter {
-    fn len(&self) -> ByteNum {
-        self.len
-    }
-
-    fn range(&self) -> Range<ByteNum> {
-        self.range.clone()
-    }
-
-    pub fn new(len: ByteNum, range: Range<ByteNum>) -> Self {
+    pub fn new(len: u64, range: Range<u64>) -> Self {
         SliceIter {
             len,
             range,
@@ -31,7 +23,10 @@ impl SliceIter {
         }
     }
 
-    pub fn set_len(&mut self, len: ByteNum) {
+    /// set the length of the slice
+    ///
+    /// this can only be done before the first call to next
+    pub fn set_len(&mut self, len: u64) {
         assert!(self.res.is_none());
         self.len = len;
     }
@@ -39,10 +34,10 @@ impl SliceIter {
     // todo: it is easy to make this a proper iterator, and even possible
     // to make it an iterator without any state, but let's just keep it simple
     // for now.
-    fn iterate(len: ByteNum, range: Range<ByteNum>) -> Vec<StreamItem> {
+    fn iterate(len: u64, range: Range<u64>) -> Vec<StreamItem> {
         struct State {
-            len: ByteNum,
-            range: Range<ByteNum>,
+            len: u64,
+            range: Range<u64>,
             res: Vec<StreamItem>,
         }
         // make sure the range is within 0..len
@@ -51,12 +46,12 @@ impl SliceIter {
         range.end = range.end.min(len);
         impl State {
             fn hashes(&self) -> NodeNum {
-                num_hashes(blocks(self.len, BlockLevel(0)))
+                num_hashes(blocks(ByteNum(self.len), BlockLevel(0)))
             }
 
             fn traverse(&mut self, offset: NodeNum) {
-                let position = ByteNum((offset.0 + 1) / 2 * 1024);
-                let is_root = offset == root(blocks(self.len, BlockLevel(0)));
+                let position = (offset.0 + 1) / 2 * 1024;
+                let is_root = offset == root(blocks(ByteNum(self.len), BlockLevel(0)));
                 if level(offset).0 > 0 {
                     let (left, right) = if self.range.end <= position {
                         (true, false)
@@ -92,7 +87,7 @@ impl SliceIter {
             range,
             res: vec![],
         };
-        state.traverse(root(blocks(len, BlockLevel(0))));
+        state.traverse(root(blocks(ByteNum(len), BlockLevel(0))));
         state.res
     }
 
@@ -107,7 +102,7 @@ impl SliceIter {
     ///
     /// this is a simple use case for how to use the slice iterator to figure
     /// out what is what.
-    fn print_bao_encoded(len: ByteNum, range: Range<ByteNum>, slice: &[u8]) {
+    pub fn print_bao_encoded(len: u64, range: Range<u64>, slice: &[u8]) {
         let mut offset = 0;
         for item in SliceIter::new(len, range) {
             if slice.len() < offset + item.size() {
@@ -139,14 +134,9 @@ impl SliceIter {
                     end,
                     is_root,
                 } => {
-                    let size = end.to_usize() - start.to_usize();
-                    let data = &slice[offset..offset + size];
-                    println!(
-                        "data range={}..{} root={}",
-                        start.to_usize(),
-                        start.to_usize() + size,
-                        is_root
-                    );
+                    let size = end - start;
+                    let data = &slice[offset..offset + size as usize];
+                    println!("data range={}..{} root={}", start, start + size, is_root);
                     for chunk in data.chunks(32) {
                         println!("{}", hex::encode(chunk));
                     }
@@ -195,9 +185,9 @@ pub enum StreamItem {
     /// the data to be actually returned can be just a subset of this.
     Data {
         /// start of the range
-        start: ByteNum,
+        start: u64,
         /// end of the range
-        end: ByteNum,
+        end: u64,
         /// is this leaf the root
         is_root: bool,
     },
@@ -208,7 +198,7 @@ impl StreamItem {
         match self {
             StreamItem::Header => 8,
             StreamItem::Hashes { .. } => 64,
-            StreamItem::Data { start, end, .. } => end.to_usize() - start.to_usize(),
+            StreamItem::Data { start, end, .. } => (end - start) as usize,
         }
     }
 
@@ -220,36 +210,57 @@ impl StreamItem {
 pub struct SliceValidator<R> {
     /// the inner reader
     inner: R,
+
     /// The slice iterator
     ///
     /// This is used to figure out what to expect from the reader.
-    /// It also provides info like the total length and the range.
+    ///
+    /// It also stores and provides the total length and the slice range.
     iter: SliceIter,
+
     // hash stack for validation
+    //
+    // gets initialized with the root hash
     stack: Vec<blake3::Hash>,
+
     // buffer for incomplete items
+    //
+    // this is used for both reading and writing
+    //
+    // it can contain an 8 byte header, 64 bytes of hashes or up to 1024 bytes of data
     buf: [u8; 1024],
-    // start of the buffer, sometimes useful
+
+    // start of the buffer
+    //
+    // when incrementally reading a buffer in the async reader, this indicates the
+    // start of the free part of the buffer
+    //
+    // when incrementally writing a buffer in both the sync and async reader, this
+    // indicates the start of the occupied part of the buffer
+    //
+    // the overall length of the buffer is in both cases determined by the current item
     buf_start: usize,
 }
 
 impl<R> SliceValidator<R> {
-    fn new(inner: R, hash: blake3::Hash, start: u64, len: u64) -> Self {
+    /// create a new slice validator for the given hash and range
+    pub fn new(inner: R, hash: blake3::Hash, start: u64, len: u64) -> Self {
         let range = start..start.saturating_add(len);
         Self {
             inner,
-            iter: SliceIter::new(ByteNum(0), ByteNum(range.start)..ByteNum(range.end)),
+            iter: SliceIter::new(0, range.start..range.end),
             stack: vec![hash],
             buf: [0; 1024],
             buf_start: 0,
         }
     }
 
-    fn into_inner(self) -> R {
+    /// get back the wrapped reader
+    pub fn into_inner(self) -> R {
         self.inner
     }
 
-    fn range(&self) -> &Range<ByteNum> {
+    fn range(&self) -> &Range<u64> {
         &self.iter.range
     }
 
@@ -262,8 +273,8 @@ impl<R> SliceValidator<R> {
                 let range = self.range();
                 let start1 = start.max(&range.start);
                 let end1 = end.min(&range.end);
-                let start2 = start1.to_usize() - start.to_usize();
-                let end2 = end1.to_usize() - start.to_usize();
+                let start2 = (start1 - start) as usize;
+                let end2 = (end1 - start) as usize;
                 &self.buf[start2..end2]
             }
         }
@@ -273,7 +284,7 @@ impl<R> SliceValidator<R> {
         match item {
             StreamItem::Header => {
                 let len = u64::from_le_bytes(self.buf[0..8].try_into().unwrap());
-                self.iter.set_len(ByteNum(len));
+                self.iter.set_len(len);
             }
             StreamItem::Hashes {
                 left,
@@ -300,11 +311,11 @@ impl<R> SliceValidator<R> {
                 end,
                 is_root,
             } => {
-                debug_assert!(start.0 % 1024 == 0);
-                let chunk = start.0 / 1024;
+                debug_assert!(start % 1024 == 0);
+                let chunk = start / 1024;
                 let mut hasher = blake3::guts::ChunkState::new(chunk);
-                let size = end.to_usize() - start.to_usize();
-                hasher.update(&self.buf[0..size]);
+                let size = end - start;
+                hasher.update(&self.buf[0..size as usize]);
                 let expected = self.stack.pop().unwrap();
                 let actual = hasher.finalize(is_root);
                 if expected != actual {
@@ -321,30 +332,24 @@ impl<R> SliceValidator<R> {
     }
 }
 
-impl<R: Read> SliceValidator<R> {
-    fn next0(&mut self) -> io::Result<Option<StreamItem>> {
-        let iter = &mut self.iter;
-
-        // get next item - if there is none, we are done
-        let item = match iter.peek() {
-            Some(item) => item,
-            None => return Ok(None),
-        };
-
-        // read the item, whatever it is
-        self.inner.read_exact(&mut self.buf[0..item.size()])?;
-
-        // validate and return the item
-        self.next_with_full_buffer(item)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-    }
-}
-
 impl<R: Read> Iterator for SliceValidator<R> {
     type Item = std::io::Result<StreamItem>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.next0().transpose()
+        let iter = &mut self.iter;
+
+        // get next item - if there is none, we are done
+        let item = iter.peek()?;
+
+        // read the item, whatever it is
+        if let Err(cause) = self.inner.read_exact(&mut self.buf[0..item.size()]) {
+            return Some(Err(cause));
+        }
+
+        // validate and return the item
+        self.next_with_full_buffer(item)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            .transpose()
     }
 }
 
@@ -392,20 +397,20 @@ impl<R: AsyncRead + Unpin> Stream for SliceValidator<R> {
     }
 }
 
-struct SliceReader<R> {
+pub struct SliceReader<R> {
     inner: SliceValidator<R>,
     current_item: Option<StreamItem>,
 }
 
 impl<R> SliceReader<R> {
-    fn new(inner: R, hash: blake3::Hash, start: u64, len: u64) -> Self {
+    pub fn new(inner: R, hash: blake3::Hash, start: u64, len: u64) -> Self {
         Self {
             inner: SliceValidator::new(inner, hash, start, len),
             current_item: None,
         }
     }
 
-    fn into_inner(self) -> R {
+    pub fn into_inner(self) -> R {
         self.inner.into_inner()
     }
 }
@@ -490,6 +495,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for SliceReader<R> {
 mod tests {
     use super::*;
     use bao::encode::SliceExtractor;
+    use futures::AsyncReadExt;
     use proptest::prelude::*;
     use std::io::{Cursor, Read};
 
@@ -532,6 +538,32 @@ mod tests {
         assert_eq!(cursor.position(), slice.len() as u64);
     }
 
+    /// Test implementation for the test_decode_all test, to be called by both proptest and hardcoded tests
+    async fn test_decode_all_async_impl(len: ByteNum) {
+        // create a slice encoding the entire data - equivalent to the bao inline encoding
+        let test_data = create_test_data(len.to_usize());
+        let (hash, slice) = encode_slice(&test_data, 0, len.0);
+
+        // test just validation without reading
+        let mut cursor = futures::io::Cursor::new(&slice);
+        let mut validator = SliceValidator::new(&mut cursor, hash, 0, len.0);
+        while let Some(item) = validator.next().await {
+            assert!(item.is_ok());
+        }
+        // check that we have read the entire slice
+        assert_eq!(cursor.position(), slice.len() as u64);
+
+        // test validation and reading
+        let mut cursor = futures::io::Cursor::new(&slice);
+        let mut reader = SliceReader::new(&mut cursor, hash, 0, len.0);
+        let mut data = vec![];
+        reader.read_to_end(&mut data).await.unwrap();
+        assert_eq!(data, test_data);
+
+        // check that we have read the entire slice
+        assert_eq!(cursor.position(), slice.len() as u64);
+    }
+
     /// Test implementation for the test_decode_part test, to be called by both proptest and hardcoded tests
     fn test_decode_part_impl(len: ByteNum, slice_start: ByteNum, slice_len: ByteNum) {
         let test_data = create_test_data(len.to_usize());
@@ -552,6 +584,34 @@ mod tests {
         let mut reader = SliceReader::new(&mut cursor, hash, slice_start.0, slice_len.0);
         let mut data = vec![];
         reader.read_to_end(&mut data).unwrap();
+        // check that we have read the entire slice
+        assert_eq!(cursor.position(), slice.len() as u64);
+        // check that we have read the correct data
+        let start = slice_start.min(len).to_usize();
+        let end = (slice_start + slice_len).min(len).to_usize();
+        assert_eq!(data, test_data[start..end]);
+    }
+
+    /// Test implementation for the test_decode_part test, to be called by both proptest and hardcoded tests
+    async fn test_decode_part_async_impl(len: ByteNum, slice_start: ByteNum, slice_len: ByteNum) {
+        let test_data = create_test_data(len.to_usize());
+        // create a slice encoding the given range
+        let (hash, slice) = encode_slice(&test_data, slice_start.0, slice_len.0);
+        // SliceIter::print_bao_encoded(len, slice_start..slice_start + slice_len, &slice);
+
+        // create an inner decoder to decode the entire slice
+        let mut cursor = futures::io::Cursor::new(&slice);
+        let mut validator = SliceValidator::new(&mut cursor, hash, slice_start.0, slice_len.0);
+        while let Some(item) = validator.next().await {
+            assert!(item.is_ok());
+        }
+        // check that we have read the entire slice
+        assert_eq!(cursor.position(), slice.len() as u64);
+
+        let mut cursor = futures::io::Cursor::new(&slice);
+        let mut reader = SliceReader::new(&mut cursor, hash, slice_start.0, slice_len.0);
+        let mut data = vec![];
+        reader.read_to_end(&mut data).await.unwrap();
         // check that we have read the entire slice
         assert_eq!(cursor.position(), slice.len() as u64);
         // check that we have read the correct data
@@ -582,12 +642,14 @@ mod tests {
             let len = ByteNum(size as u64);
             // test_decode_all_impl(len);
             test_decode_all_impl(len);
+            futures::executor::block_on(test_decode_all_async_impl(len));
         }
 
         #[test]
         fn test_decode_part((size, start, len) in size_start_len()) {
             // test_decode_part_impl(size, start, len);
             test_decode_part_impl(size, start, len);
+            futures::executor::block_on(test_decode_part_async_impl(size, start, len));
         }
     }
 
@@ -596,6 +658,13 @@ mod tests {
         let len = ByteNum(12343465);
         // test_decode_all_impl(len);
         test_decode_all_impl(len);
+    }
+
+    #[tokio::test]
+    async fn test_decode_all_async_1() {
+        let len = ByteNum(12343465);
+        // test_decode_all_impl(len);
+        test_decode_all_async_impl(len).await;
     }
 
     #[test]
@@ -618,6 +687,14 @@ mod tests {
         test_decode_part_impl(ByteNum(2048), ByteNum(1024), ByteNum(1024));
         test_decode_part_impl(ByteNum(4096), ByteNum(0), ByteNum(1024));
         test_decode_part_impl(ByteNum(4096), ByteNum(1024), ByteNum(1024));
+    }
+
+    #[tokio::test]
+    async fn test_decode_part_async_1() {
+        test_decode_part_async_impl(ByteNum(2048), ByteNum(0), ByteNum(1024)).await;
+        test_decode_part_async_impl(ByteNum(2048), ByteNum(1024), ByteNum(1024)).await;
+        test_decode_part_async_impl(ByteNum(4096), ByteNum(0), ByteNum(1024)).await;
+        test_decode_part_async_impl(ByteNum(4096), ByteNum(1024), ByteNum(1024)).await;
     }
 
     #[test]
