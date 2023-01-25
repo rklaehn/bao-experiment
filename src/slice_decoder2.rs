@@ -1,12 +1,69 @@
 use futures::{ready, AsyncRead, Stream, StreamExt};
 
-use crate::tree::*;
 use std::{
     io::{self, Read},
     ops::Range,
     pin::Pin,
     task::{Context, Poll},
 };
+use blake3::guts::CHUNK_LEN;
+
+type BlockNum = u64;
+type NodeNum = u64;
+
+/// Root offset given a number of leaves.
+pub fn root(leafs: BlockNum) -> NodeNum {
+    leafs.next_power_of_two() - 1
+}
+
+/// Level for an offset. 0 is for leaves, 1 is for the first level of branches, etc.
+pub fn level(offset: NodeNum) -> u32 {
+    (!offset).trailing_zeros()
+}
+
+pub fn blocks(len: u64) -> BlockNum {
+    const BLOCK_SIZE: u64 = CHUNK_LEN as u64;
+    len / BLOCK_SIZE + if len % BLOCK_SIZE == 0 { 0 } else { 1 }
+}
+
+pub fn num_hashes(blocks: BlockNum) -> NodeNum {
+    if blocks > 0 {
+        blocks * 2 - 1
+    } else {
+        1
+    }
+}
+
+fn span(offset: NodeNum) -> NodeNum {
+    1 << (!offset).trailing_zeros()
+}
+
+pub fn left_child(offset: NodeNum) -> Option<NodeNum> {
+    let span = span(offset);
+    if span == 1 {
+        None
+    } else {
+        Some(offset - span / 2)
+    }
+}
+
+fn right_child(offset: NodeNum) -> Option<NodeNum> {
+    let span = span(offset);
+    if span == 1 {
+        None
+    } else {
+        Some(offset + span / 2)
+    }
+}
+
+/// Get a valid right descendant for an offset
+pub(crate) fn right_descendant(offset: NodeNum, len: NodeNum) -> Option<NodeNum> {
+    let mut offset = right_child(offset)?;
+    while offset >= len {
+        offset = left_child(offset)?;
+    }
+    Some(offset)
+}
 
 pub struct SliceIter {
     len: u64,
@@ -45,7 +102,7 @@ impl SliceIter {
         range.start = range.start.min(len);
         range.end = range.end.min(len);
         impl State {
-            fn hashes(&self) -> NodeNum {
+            fn hashes(&self) -> u64 {
                 num_hashes(blocks(self.len))
             }
 
@@ -102,6 +159,7 @@ impl SliceIter {
     ///
     /// this is a simple use case for how to use the slice iterator to figure
     /// out what is what.
+    #[allow(dead_code)]
     pub fn print_bao_encoded(len: u64, range: Range<u64>, slice: &[u8]) {
         let mut offset = 0;
         for item in SliceIter::new(len, range) {
@@ -702,5 +760,73 @@ mod tests {
     #[test]
     fn test_decode_part_4() {
         test_decode_part_impl((3073), (1024), (1025));
+    }
+
+    #[test]
+    fn test_right_descendant() {
+        for i in 1..11 {
+            println!(
+                "valid_right_child({}, 9), {:?}",
+                i,
+                right_descendant(i, 9)
+            );
+        }
+    }
+
+    #[test]
+    fn test_span() {
+        for i in 0..10 {
+            println!("assert_eq!(span({}), {})", i, span(i))
+        }
+    }
+
+    #[test]
+    fn test_level() {
+        for i in 0..10 {
+            println!("assert_eq!(level({}), {})", i, level(i))
+        }
+        assert_eq!(level(0), 0);
+        assert_eq!(level(1), 1);
+        assert_eq!(level(2), 0);
+        assert_eq!(level(3), 2);
+    }
+
+    #[test]
+    fn test_root() {
+        assert_eq!(root(0), 0);
+        assert_eq!(root(1), 0);
+        assert_eq!(root(2), 1);
+        assert_eq!(root(3), 3);
+        assert_eq!(root(4), 3);
+        assert_eq!(root(5), 7);
+        assert_eq!(root(6), 7);
+        assert_eq!(root(7), 7);
+        assert_eq!(root(8), 7);
+        assert_eq!(root(9), 15);
+        assert_eq!(root(10), 15);
+        assert_eq!(root(11), 15);
+        assert_eq!(root(12), 15);
+        assert_eq!(root(13), 15);
+        assert_eq!(root(14), 15);
+        assert_eq!(root(15), 15);
+        assert_eq!(root(16), 15);
+        assert_eq!(root(17), 31);
+        assert_eq!(root(18), 31);
+        assert_eq!(root(19), 31);
+        assert_eq!(root(20), 31);
+        assert_eq!(root(21), 31);
+        assert_eq!(root(22), 31);
+        assert_eq!(root(23), 31);
+        assert_eq!(root(24), 31);
+        assert_eq!(root(25), 31);
+        assert_eq!(root(26), 31);
+        assert_eq!(root(27), 31);
+        assert_eq!(root(28), 31);
+        assert_eq!(root(29), 31);
+        assert_eq!(root(30), 31);
+        assert_eq!(root(31), 31);
+        for i in 1..32 {
+            println!("assert_eq!(root({}),{});", i, root(i))
+        }
     }
 }
